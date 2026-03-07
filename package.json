@@ -1,0 +1,22 @@
+{
+  "name": "text-blocks-figma-plugin",
+  "version": "1.0.0",
+  "description": "Figma plugin that converts text nodes to skeleton block representations",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "keywords": [
+    "figma",
+    "plugin",
+    "text",
+    "skeleton",
+    "blocks"
+  ],
+  "author": "Ixley (with Claude)",
+  "license": "MIT",
+  "devDependencies": {
+    "@figma/plugin-typings": "^1.88.0",
+    "typescript": "^5.3.3"
+  }
+}

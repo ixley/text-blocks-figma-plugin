@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        font-family:
+          Inter,
+          -apple-system,
+          BlinkMacSystemFont,
+          sans-serif;
+        font-size: 11px;
+        color: #333;
+        background: #fff;
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      label {
+        font-size: 11px;
+        font-weight: 500;
+        color: #666;
+        letter-spacing: 0.02em;
+      }
+
+      .input-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      input {
+        &[type="number"],
+        &[type="text"] {
+          height: 30px;
+          border: 1px solid #e0e0e0;
+          border-radius: 4px;
+          padding: 0 8px;
+          font-size: 11px;
+          font-family: inherit;
+          color: #333;
+          background: #fff;
+          outline: none;
+          transition: border-color 0.1s;
+        }
+
+        &[type="number"] {
+          width: 72px;
+        }
+        &[type="text"] {
+          width: 100%;
+        }
+
+        &:focus {
+          border-color: #18a0fb;
+        }
+        &::placeholder {
+          color: #ccc;
+        }
+      }
+
+      .unit {
+        font-size: 11px;
+        color: #999;
+        flex-shrink: 0;
+      }
+
+      .hint {
+        font-size: 10px;
+        color: #aaa;
+        line-height: 1.4;
+        margin-top: 2px;
+      }
+
+      hr {
+        border: none;
+        border-top: 1px solid #f0f0f0;
+      }
+
+      .actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+        padding-top: 2px;
+      }
+
+      button {
+        height: 30px;
+        padding: 0 14px;
+        border-radius: 6px;
+        font-size: 11px;
+        font-family: inherit;
+        font-weight: 500;
+        cursor: pointer;
+        border: none;
+        transition:
+          background 0.1s,
+          opacity 0.1s;
+      }
+
+      #cancel {
+        background: #f5f5f5;
+        color: #333;
+        &:hover {
+          background: #ebebeb;
+        }
+      }
+
+      #save {
+        background: #18a0fb;
+        color: #fff;
+        &:hover {
+          background: #0d8de3;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="field">
+      <label>Opacity</label>
+      <div class="input-row">
+        <input type="number" id="opacity" min="1" max="100" step="1" />
+        <span class="unit">%</span>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>Corner Radius</label>
+      <div class="input-row">
+        <input type="number" id="cornerRadius" min="0" step="0.5" />
+        <span class="unit">px</span>
+      </div>
+    </div>
+
+    <hr />
+
+    <div class="field">
+      <label>Skip Prefix</label>
+      <input type="text" id="skipPrefix" maxlength="10" placeholder="e.g. _, —, *  (leave blank to disable)" />
+      <p class="hint">Layers whose name starts with this prefix will not be converted.</p>
+    </div>
+
+    <hr />
+
+    <div class="actions">
+      <button id="cancel">Cancel</button>
+      <button id="save">Save</button>
+    </div>
+
+    <script>
+      const opacityEl = document.getElementById("opacity");
+      const cornerRadiusEl = document.getElementById("cornerRadius");
+      const skipPrefixEl = document.getElementById("skipPrefix");
+
+      // Receive current settings from the plugin and pre-populate the form.
+      window.onmessage = (event) => {
+        const msg = event.data.pluginMessage;
+        if (!msg || msg.type !== "init") return;
+        const s = msg.settings;
+        opacityEl.value = String(Math.round(s.opacity * 100));
+        cornerRadiusEl.value = String(s.cornerRadius);
+        skipPrefixEl.value = s.skipPrefix || "";
+      };
+
+      document.getElementById("save").onclick = () => {
+        const opacity = Math.min(100, Math.max(1, parseFloat(opacityEl.value) || 40)) / 100;
+        const cornerRadius = Math.max(0, parseFloat(cornerRadiusEl.value) || 0);
+        const skipPrefix = skipPrefixEl.value.trim();
+        parent.postMessage({ pluginMessage: { type: "save", settings: { opacity, cornerRadius, skipPrefix } } }, "*");
+      };
+
+      document.getElementById("cancel").onclick = () => {
+        parent.postMessage({ pluginMessage: { type: "cancel" } }, "*");
+      };
+    </script>
+  </body>
+</html>
