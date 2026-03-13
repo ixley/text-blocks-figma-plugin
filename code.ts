@@ -37,6 +37,15 @@ const DEFAULT_SETTINGS: PluginSettings = {
 // Loaded once at startup; mutated by loadSettings() before any processing.
 let settings: PluginSettings = { ...DEFAULT_SETTINGS };
 
+// Tracks fonts loaded during this plugin run to avoid redundant loadFontAsync calls.
+// Figma caches loaded fonts internally but still incurs async overhead per call.
+const loadedFonts = new Set<string>();
+
+// Timestamp of the last macrotask yield; reset at the start of each conversion run.
+// Used by yieldToUI() to throttle yields so the spinner stays alive without
+// adding a setTimeout pause after every single node.
+let lastYieldTime = 0;
+
 async function loadSettings(): Promise<PluginSettings> {
   const stored = await figma.clientStorage.getAsync(SETTINGS_KEY);
   // Spread stored values over defaults so added keys in future versions are backfilled.
@@ -146,7 +155,17 @@ async function loadFontsForTextNode(node: TextNode): Promise<void> {
     }
   }
 
-  await Promise.all(toLoad.map((fn) => figma.loadFontAsync(fn)));
+  // Filter out fonts already loaded in this run to avoid redundant async calls.
+  const uncached = toLoad.filter((fn) => {
+    const key = `${fn.family}::${fn.style}`;
+    if (loadedFonts.has(key)) return false;
+    loadedFonts.add(key);
+    return true;
+  });
+
+  if (uncached.length > 0) {
+    await Promise.all(uncached.map((fn) => figma.loadFontAsync(fn)));
+  }
 }
 
 // ── Per-line width measurement ─────────────────────────────────────────────
@@ -214,11 +233,14 @@ function simulateWordWrap(text: string, maxWidth: number, temp: TextNode): numbe
 //     b. For each line: empty → 0, fits → measured width, wraps → word-break simulation.
 //     c. Collect all line widths into one inner array for this paragraph.
 //  4. Remove the temp node (in a finally block).
-async function measureLineWidths(node: TextNode, wrapWidth: number): Promise<number[][]> {
+// `sharedTemp` may be passed in from the caller to avoid per-node create/destroy overhead.
+// If omitted, a local temp node is created and cleaned up within this call.
+async function measureLineWidths(node: TextNode, wrapWidth: number, sharedTemp?: TextNode): Promise<number[][]> {
   await loadFontsForTextNode(node);
 
-  const temp = figma.createText();
-  temp.visible = false; // Keep the temp node off-screen while measuring
+  const ownTemp = sharedTemp === undefined;
+  const temp = ownTemp ? figma.createText() : sharedTemp;
+  if (ownTemp) temp.visible = false;
 
   try {
     temp.fontName = getFirstFontName(node);
@@ -270,8 +292,7 @@ async function measureLineWidths(node: TextNode, wrapWidth: number): Promise<num
 
     return segments;
   } finally {
-    // Always remove the temp node, even if an error is thrown mid-measurement
-    temp.remove();
+    if (ownTemp) temp.remove();
   }
 }
 
@@ -343,7 +364,7 @@ function buildSegmentFrame(
 //   2. Multiple segments (\n-separated paragraphs)
 //        → outer FrameNode (itemSpacing = paragraphSpacing)
 //          containing one inner segment frame per paragraph
-async function createBlockReplacement(node: TextNode): Promise<RectangleNode | FrameNode> {
+async function createBlockReplacement(node: TextNode, sharedTemp?: TextNode): Promise<RectangleNode | FrameNode> {
   const fontSize = getEffectiveFontSize(node);
   const effectiveLH = getEffectiveLineHeight(node);
   const fills = getTextFills(node);
@@ -357,7 +378,7 @@ async function createBlockReplacement(node: TextNode): Promise<RectangleNode | F
   // Simulate word-wrapping at the container boundary (node.width), NOT at
   // contentWidth. contentWidth is the widest rendered line — using it as the
   // wrap threshold would be too narrow and produce extra lines.
-  const segments = await measureLineWidths(node, node.width);
+  const segments = await measureLineWidths(node, node.width, sharedTemp);
   const totalLines = segments.reduce((sum, s) => sum + s.length, 0);
 
   // ── Case 1 & 2: Single segment (one or more lines) → one segment frame ────
@@ -431,10 +452,27 @@ function applyLayoutProps(from: TextNode, to: RectangleNode | FrameNode, xOffset
 // ── Tree traversal ─────────────────────────────────────────────────────────
 
 function hasTextDescendant(node: SceneNode & ChildrenMixin): boolean {
-  return node.findAll((n) => n.type === "TEXT").length > 0;
+  return node.findOne((n) => n.type === "TEXT") !== null;
 }
 
-async function replaceTextNode(textNode: TextNode, parent: SceneNode & ChildrenMixin): Promise<void> {
+// Yields a macrotask to the event loop so Figma's renderer can update the
+// progress spinner and canvas — but only if at least YIELD_INTERVAL_MS have
+// elapsed since the last yield. This keeps the UI alive without adding a
+// setTimeout pause after every single node (which would negate the speedup).
+//
+// Must use setTimeout (macrotask), not Promise.resolve() (microtask) —
+// only macrotask boundaries allow a rendering pass to occur.
+const YIELD_INTERVAL_MS = 50; // ~20 renders/sec; enough to keep the spinner smooth
+
+async function yieldToUI(): Promise<void> {
+  const now = Date.now();
+  if (now - lastYieldTime >= YIELD_INTERVAL_MS) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    lastYieldTime = Date.now();
+  }
+}
+
+async function replaceTextNode(textNode: TextNode, parent: SceneNode & ChildrenMixin, sharedTemp?: TextNode): Promise<void> {
   currentNodeName = textNode.name;
 
   const children = parent.children as ReadonlyArray<SceneNode>;
@@ -442,7 +480,7 @@ async function replaceTextNode(textNode: TextNode, parent: SceneNode & ChildrenM
   if (index === -1) return; // Defensive: node not found in parent
 
   // Build replacement BEFORE remove() — node properties become unreliable after removal
-  const replacement = await createBlockReplacement(textNode);
+  const replacement = await createBlockReplacement(textNode, sharedTemp);
 
   // Remove original, then insert replacement at the same slot.
   // After remove(), all subsequent indices shift down by 1, so `index` now
@@ -451,14 +489,14 @@ async function replaceTextNode(textNode: TextNode, parent: SceneNode & ChildrenM
   parent.insertChild(index, replacement);
 }
 
-async function processNode(node: SceneNode): Promise<void> {
+async function processNode(node: SceneNode, sharedTemp?: TextNode): Promise<void> {
   currentNodeName = node.name;
 
   if (node.type === "INSTANCE") {
     if (hasTextDescendant(node)) {
       currentNodeName = node.name;
       const detached = node.detachInstance();
-      await processNode(detached);
+      await processNode(detached, sharedTemp);
     }
     // Instances without text are left intact
     return;
@@ -480,15 +518,16 @@ async function processNode(node: SceneNode): Promise<void> {
     if (settings.skipPrefix && child.name.startsWith(settings.skipPrefix)) continue;
 
     if (child.type === "TEXT") {
-      await replaceTextNode(child, container);
+      await replaceTextNode(child, container, sharedTemp);
+      await yieldToUI(); // let Figma's renderer update between replacements
     } else if (child.type === "INSTANCE") {
       if (hasTextDescendant(child)) {
         const detached = child.detachInstance();
-        await processNode(detached);
+        await processNode(detached, sharedTemp);
       }
       // Instances without text are left intact
     } else if ("children" in child) {
-      await processNode(child);
+      await processNode(child, sharedTemp);
     }
     // All other leaf node types (rectangles, ellipses, vectors, etc.) are skipped
   }
@@ -532,29 +571,44 @@ async function processNode(node: SceneNode): Promise<void> {
 
   const node = selection[0];
 
+  // Reset yield timer so the first yield fires after YIELD_INTERVAL_MS of actual work,
+  // not immediately on the first node.
+  lastYieldTime = Date.now();
+
+  // Create one shared temp text node for all measurements in this run.
+  // Reusing it avoids per-node create/destroy overhead across many text nodes.
+  // It must be removed before closePlugin() in every exit path.
+  const measureTemp = figma.createText();
+  measureTemp.visible = false;
+
   try {
     // Allow directly-selected text nodes — replace just that one node.
     if (node.type === "TEXT") {
       const parent = node.parent;
       if (!parent || !("children" in parent)) {
+        measureTemp.remove();
         figma.closePlugin("Cannot replace text node — no valid parent container.");
         return;
       }
-      await replaceTextNode(node, parent as SceneNode & ChildrenMixin);
+      await replaceTextNode(node, parent as SceneNode & ChildrenMixin, measureTemp);
+      measureTemp.remove();
       figma.notify("Text converted to block.");
       figma.closePlugin();
       return;
     }
 
     if (!("children" in node)) {
+      measureTemp.remove();
       figma.closePlugin("Selected node has no children. Select a frame, group, or component.");
       return;
     }
 
-    await processNode(node);
+    await processNode(node, measureTemp);
+    measureTemp.remove();
     figma.notify("Text converted to blocks.");
     figma.closePlugin();
   } catch (err) {
+    measureTemp.remove();
     const msg = err instanceof Error ? err.message : String(err);
     figma.closePlugin(`Error processing "${currentNodeName}": ${msg}. Press Cmd+Z to undo any partial changes.`);
   }
