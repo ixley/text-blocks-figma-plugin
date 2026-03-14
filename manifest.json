@@ -1,6 +1,6 @@
 {
   "name": "Text Blocks",
-  "id": "text-blocks",
+  "id": "1614467447231618728",
   "api": "1.0.0",
   "main": "code.js",
   "ui": "ui.html",
@@ -8,6 +8,7 @@
   "networkAccess": {
     "allowedDomains": ["none"]
   },
+  "documentAccess": "dynamic-page",
   "menu": [
     { "name": "Convert", "command": "main" },
     { "name": "Settings", "command": "settings" }
