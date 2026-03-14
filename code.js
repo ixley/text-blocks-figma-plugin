@@ -327,8 +327,8 @@ async function createBlockReplacement(node, sharedTemp) {
     const fills = getTextFills(node);
     const contentWidth = getContentWidth(node);
     const xOffset = getContentXOffset(node);
-    const blockHeight = fontSize;
-    const lineSpacing = Math.max(0, effectiveLH - fontSize);
+    const blockHeight = fontSize * 0.9;
+    const lineSpacing = Math.max(0, effectiveLH - blockHeight);
     const paragraphSpacing = getParagraphSpacing(node);
     const align = getCounterAxisAlign(node);
     // Simulate word-wrapping at the container boundary (node.width), NOT at
