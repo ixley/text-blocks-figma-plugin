@@ -13,7 +13,7 @@
     "skeleton",
     "blocks"
   ],
-  "author": "Ixley (with Claude)",
+  "author": "Jeff French",
   "license": "MIT",
   "devDependencies": {
     "@figma/plugin-typings": "^1.88.0",

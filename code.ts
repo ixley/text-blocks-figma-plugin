@@ -564,46 +564,34 @@ async function processNode(node: SceneNode, sharedTemp?: TextNode): Promise<void
     return;
   }
 
-  if (selection.length > 1) {
-    figma.closePlugin("Select only one node.");
-    return;
-  }
-
-  const node = selection[0];
-
   // Reset yield timer so the first yield fires after YIELD_INTERVAL_MS of actual work,
   // not immediately on the first node.
   lastYieldTime = Date.now();
 
   // Create one shared temp text node for all measurements in this run.
-  // Reusing it avoids per-node create/destroy overhead across many text nodes.
+  // Reusing it avoids per-node create/destroy overhead across all selected nodes.
   // It must be removed before closePlugin() in every exit path.
   const measureTemp = figma.createText();
   measureTemp.visible = false;
 
   try {
-    // Allow directly-selected text nodes — replace just that one node.
-    if (node.type === "TEXT") {
-      const parent = node.parent;
-      if (!parent || !("children" in parent)) {
-        measureTemp.remove();
-        figma.closePlugin("Cannot replace text node — no valid parent container.");
-        return;
+    // Process each selected node (supports single or multiple selections).
+    for (const node of selection) {
+      // Allow directly-selected text nodes — replace just that one node.
+      if (node.type === "TEXT") {
+        const parent = node.parent;
+        if (!parent || !("children" in parent)) {
+          // Skip invalid text nodes with no parent
+          continue;
+        }
+        await replaceTextNode(node, parent as SceneNode & ChildrenMixin, measureTemp);
+      } else if ("children" in node) {
+        // Process container nodes (frames, groups, components).
+        await processNode(node, measureTemp);
       }
-      await replaceTextNode(node, parent as SceneNode & ChildrenMixin, measureTemp);
-      measureTemp.remove();
-      figma.notify("Text converted to block.");
-      figma.closePlugin();
-      return;
+      // Skip nodes with no children (leaf nodes like rectangles, vectors, etc.)
     }
 
-    if (!("children" in node)) {
-      measureTemp.remove();
-      figma.closePlugin("Selected node has no children. Select a frame, group, or component.");
-      return;
-    }
-
-    await processNode(node, measureTemp);
     measureTemp.remove();
     figma.notify("Text converted to blocks.");
     figma.closePlugin();
