@@ -319,11 +319,13 @@ function createLineRect(width: number, height: number, fills: ReadonlyArray<Pain
 //          = N × effectiveLH  ✓
 function buildSegmentFrame(
   lineWidths: number[],
-  maxWidth: number,
+  containerWidth: number,
+  contentWidth: number,
   blockHeight: number,
   lineSpacing: number,
   fills: ReadonlyArray<Paint>,
   align: "MIN" | "CENTER" | "MAX",
+  shouldAutoSize: boolean,
 ): FrameNode {
   const frame = figma.createFrame();
   frame.layoutMode = "VERTICAL";
@@ -331,7 +333,7 @@ function buildSegmentFrame(
   frame.counterAxisAlignItems = align;
   // resize() before primaryAxisSizingMode = AUTO — resize() implicitly resets
   // primary axis to FIXED, so AUTO must be set after children are appended.
-  frame.resize(Math.max(1, maxWidth), 1);
+  frame.resize(Math.max(1, containerWidth), 1);
   frame.itemSpacing = lineSpacing;
   frame.paddingTop = 0;
   frame.paddingBottom = lineSpacing; // trailing leading — fixes collapsed height
@@ -342,17 +344,20 @@ function buildSegmentFrame(
 
   for (const lineWidth of lineWidths) {
     // Clamp: simulation runs at node.width so a line could theoretically exceed
-    // maxWidth (= contentWidth) by approximation; also guard against negatives.
-    const clampedWidth = Math.min(Math.max(lineWidth, 0), maxWidth);
+    // contentWidth by approximation; also guard against negatives.
+    const clampedWidth = Math.min(Math.max(lineWidth, 0), contentWidth);
     const rect = createLineRect(clampedWidth, blockHeight, fills);
     rect.layoutAlign = "INHERIT"; // keep measured width, don't stretch
     rect.layoutGrow = 0;
     frame.appendChild(rect);
   }
 
-  // Set HUG after resize() and after children are appended so Figma computes
-  // the real height from child content rather than the placeholder 1px.
-  frame.primaryAxisSizingMode = "AUTO";
+  // Set sizing mode after children are appended so Figma computes height from content.
+  if (shouldAutoSize) {
+    frame.primaryAxisSizingMode = "AUTO";
+  }
+  // If not auto-sizing, keep frame at containerWidth (fixed — no AUTO needed)
+
   return frame;
 }
 
@@ -375,6 +380,14 @@ async function createBlockReplacement(node: TextNode, sharedTemp?: TextNode): Pr
   const paragraphSpacing = getParagraphSpacing(node);
   const align = getCounterAxisAlign(node);
 
+  // Preserve the original text node's width constraint and sizing mode.
+  // containerWidth drives the frame size; contentWidth drives the rectangle widths.
+  // shouldAutoSize mirrors textAutoResize: auto-sizing text → hug frame, fixed text → fixed frame.
+  // layoutSizingHorizontal (HUG) is applied separately in replaceTextNode, after insertion,
+  // because Figma only allows sizing-mode writes on frames that already have a parent.
+  const containerWidth = node.width;
+  const shouldAutoSize = node.textAutoResize !== "NONE";
+
   // Simulate word-wrapping at the container boundary (node.width), NOT at
   // contentWidth. contentWidth is the widest rendered line — using it as the
   // wrap threshold would be too narrow and produce extra lines.
@@ -386,7 +399,7 @@ async function createBlockReplacement(node: TextNode, sharedTemp?: TextNode): Pr
   // paddingBottom = lineSpacing gives the correct total height = effectiveLH,
   // matching the vertical footprint of the original text node.
   if (segments.length === 1) {
-    const frame = buildSegmentFrame(segments[0], contentWidth, blockHeight, lineSpacing, fills, align);
+    const frame = buildSegmentFrame(segments[0], containerWidth, contentWidth, blockHeight, lineSpacing, fills, align, shouldAutoSize);
     applyLayoutProps(node, frame, xOffset);
     return frame;
   }
@@ -399,7 +412,7 @@ async function createBlockReplacement(node: TextNode, sharedTemp?: TextNode): Pr
   outer.layoutMode = "VERTICAL";
   outer.counterAxisSizingMode = "FIXED";
   outer.counterAxisAlignItems = align;
-  outer.resize(Math.max(1, contentWidth), 1);
+  outer.resize(Math.max(1, containerWidth), 1);
   outer.itemSpacing = paragraphSpacing;
   outer.paddingTop = 0;
   outer.paddingBottom = 0;
@@ -409,13 +422,17 @@ async function createBlockReplacement(node: TextNode, sharedTemp?: TextNode): Pr
   outer.clipsContent = false;
 
   for (const segmentLines of segments) {
-    const inner = buildSegmentFrame(segmentLines, contentWidth, blockHeight, lineSpacing, fills, align);
+    const inner = buildSegmentFrame(segmentLines, containerWidth, contentWidth, blockHeight, lineSpacing, fills, align, shouldAutoSize);
     inner.layoutAlign = "INHERIT";
     inner.layoutGrow = 0;
     outer.appendChild(inner);
   }
 
-  outer.primaryAxisSizingMode = "AUTO";
+  if (shouldAutoSize) {
+    outer.primaryAxisSizingMode = "AUTO";
+  }
+  // If not auto-sizing, keep outer frame at containerWidth (fixed)
+
   applyLayoutProps(node, outer, xOffset);
   return outer;
 }
@@ -479,6 +496,10 @@ async function replaceTextNode(textNode: TextNode, parent: SceneNode & ChildrenM
   const index = children.indexOf(textNode);
   if (index === -1) return; // Defensive: node not found in parent
 
+  // Read layoutSizingHorizontal BEFORE removal — node properties become unreliable after.
+  const nodeAsAL = textNode as unknown as { layoutSizingHorizontal?: string };
+  const originalSizingH = nodeAsAL.layoutSizingHorizontal;
+
   // Build replacement BEFORE remove() — node properties become unreliable after removal
   const replacement = await createBlockReplacement(textNode, sharedTemp);
 
@@ -487,6 +508,19 @@ async function replaceTextNode(textNode: TextNode, parent: SceneNode & ChildrenM
   // correctly points to the vacated position.
   textNode.remove();
   parent.insertChild(index, replacement);
+
+  // Apply HUG or FILL sizing after insertion — Figma only allows layoutSizingHorizontal
+  // writes on frames that already have a parent. Both are safe here because the
+  // replacement is now in the same auto-layout parent as the original text node was.
+  // FIXED is the default so needs no explicit assignment.
+  if (
+    (originalSizingH === "HUG" || originalSizingH === "FILL") &&
+    "layoutMode" in parent &&
+    (parent as FrameNode).layoutMode !== "NONE"
+  ) {
+    const repAsAL = replacement as unknown as { layoutSizingHorizontal?: string };
+    repAsAL.layoutSizingHorizontal = originalSizingH;
+  }
 }
 
 async function processNode(node: SceneNode, sharedTemp?: TextNode): Promise<void> {
