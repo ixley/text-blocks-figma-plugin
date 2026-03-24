@@ -361,6 +361,25 @@ function buildSegmentFrame(
   return frame;
 }
 
+// Caps the total visual line count in `segments` to `maxLines`.
+// Walks through segments accumulating line counts; truncates the last active
+// segment and drops any that follow once the limit is reached.
+function truncateSegments(segments: number[][], maxLines: number): number[][] {
+  const result: number[][] = [];
+  let remaining = maxLines;
+  for (const seg of segments) {
+    if (remaining <= 0) break;
+    if (seg.length <= remaining) {
+      result.push(seg);
+      remaining -= seg.length;
+    } else {
+      result.push(seg.slice(0, remaining));
+      remaining = 0;
+    }
+  }
+  return result;
+}
+
 // Builds the complete block replacement for a TextNode.
 //
 // Two structural cases:
@@ -391,7 +410,15 @@ async function createBlockReplacement(node: TextNode, sharedTemp?: TextNode): Pr
   // Simulate word-wrapping at the container boundary (node.width), NOT at
   // contentWidth. contentWidth is the widest rendered line — using it as the
   // wrap threshold would be too narrow and produce extra lines.
-  const segments = await measureLineWidths(node, node.width, sharedTemp);
+  const rawSegments = await measureLineWidths(node, node.width, sharedTemp);
+
+  // If the text node uses line-count truncation, cap segments to match what
+  // Figma actually displays on screen.
+  const segments =
+    node.textTruncation === "ENDING" && typeof node.maxLines === "number" && node.maxLines > 0
+      ? truncateSegments(rawSegments, node.maxLines)
+      : rawSegments;
+
   const totalLines = segments.reduce((sum, s) => sum + s.length, 0);
 
   // ── Case 1 & 2: Single segment (one or more lines) → one segment frame ────
