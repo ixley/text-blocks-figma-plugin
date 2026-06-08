@@ -81,6 +81,29 @@ function getContentWidth(node) {
     // Clamp to node.width in case of subpixel rounding differences
     return Math.min(renderBounds.width, node.width);
 }
+// Returns the height of the text node's bounding box after intersecting it with
+// every ancestor frame that clips its content. This catches truncation that the
+// text node itself doesn't "know" about — e.g. an auto-height text node sitting
+// inside a smaller, clipsContent=true parent — which node.height/textTruncation
+// don't reflect (the node sizes itself to its full natural content; only the
+// parent's clipping makes part of it invisible). Returns the node's own height
+// untouched when no ancestor actually reduces the visible area.
+function getClippedVisibleHeight(node) {
+    const ownBounds = node.absoluteBoundingBox;
+    if (!ownBounds)
+        return node.height;
+    let top = ownBounds.y;
+    let bottom = ownBounds.y + ownBounds.height;
+    for (let current = node.parent; current; current = current.parent) {
+        const frame = current;
+        if (frame.clipsContent && frame.absoluteBoundingBox) {
+            const b = frame.absoluteBoundingBox;
+            top = Math.max(top, b.y);
+            bottom = Math.min(bottom, b.y + b.height);
+        }
+    }
+    return Math.max(0, bottom - top);
+}
 // Returns the horizontal offset from the text node's left edge to the render bounds'
 // left edge. Non-zero for CENTER-aligned (positive) and RIGHT-aligned (larger positive)
 // text that doesn't fill its container.
@@ -90,6 +113,19 @@ function getContentXOffset(node) {
     if (!renderBounds || !bboxBounds)
         return 0;
     return renderBounds.x - bboxBounds.x;
+}
+// Returns the vertical offset from the text node's top edge to the render bounds'
+// top edge. Non-zero for MIDDLE/BOTTOM-aligned text (textAlignVertical) whose
+// rendered lines don't start at the top of a box that's taller than its content
+// — e.g. a fixed-height ("NONE"/"TRUNCATE") box sized larger than its text.
+// Without this, the replacement (sized to the visible line count) would be
+// anchored at the box's top instead of where the text actually renders.
+function getContentYOffset(node) {
+    const renderBounds = node.absoluteRenderBounds;
+    const bboxBounds = node.absoluteBoundingBox;
+    if (!renderBounds || !bboxBounds)
+        return 0;
+    return renderBounds.y - bboxBounds.y;
 }
 // Maps textAlignHorizontal to the counterAxisAlignItems value for the wrapper frame,
 // so stacked line-rects are aligned the same way as the original text.
@@ -284,7 +320,7 @@ function createLineRect(width, height, fills) {
 //   height = paddingTop(0) + N×fontSize + (N-1)×lineSpacing + paddingBottom(lineSpacing)
 //          = N×fontSize + N×lineSpacing
 //          = N × effectiveLH  ✓
-function buildSegmentFrame(lineWidths, containerWidth, contentWidth, blockHeight, lineSpacing, fills, align, shouldAutoSize) {
+function buildSegmentFrame(lineWidths, containerWidth, contentWidth, blockHeight, lineSpacing, fills, align) {
     const frame = figma.createFrame();
     frame.layoutMode = "VERTICAL";
     frame.counterAxisSizingMode = "FIXED";
@@ -308,11 +344,12 @@ function buildSegmentFrame(lineWidths, containerWidth, contentWidth, blockHeight
         rect.layoutGrow = 0;
         frame.appendChild(rect);
     }
-    // Set sizing mode after children are appended so Figma computes height from content.
-    if (shouldAutoSize) {
-        frame.primaryAxisSizingMode = "AUTO";
-    }
-    // If not auto-sizing, keep frame at containerWidth (fixed — no AUTO needed)
+    // Always hug content height — the replacement represents only the visible
+    // (possibly truncated) lines, so it should be exactly as tall as those lines
+    // regardless of whether the original text node used a fixed or auto height.
+    // Leaving it at the resize() height of 1 (FIXED) would report height=1 to
+    // Figma's layout engine even though children visually overflow it.
+    frame.primaryAxisSizingMode = "AUTO";
     return frame;
 }
 // Caps the total visual line count in `segments` to `maxLines`.
@@ -349,34 +386,62 @@ async function createBlockReplacement(node, sharedTemp) {
     const fills = getTextFills(node);
     const contentWidth = getContentWidth(node);
     const xOffset = getContentXOffset(node);
+    const yOffset = getContentYOffset(node);
     const blockHeight = fontSize * 0.9;
     const lineSpacing = Math.max(0, effectiveLH - blockHeight);
     const paragraphSpacing = getParagraphSpacing(node);
     const align = getCounterAxisAlign(node);
-    // Preserve the original text node's width constraint and sizing mode.
+    // Preserve the original text node's width constraint.
     // containerWidth drives the frame size; contentWidth drives the rectangle widths.
-    // shouldAutoSize mirrors textAutoResize: auto-sizing text → hug frame, fixed text → fixed frame.
     // layoutSizingHorizontal (HUG) is applied separately in replaceTextNode, after insertion,
     // because Figma only allows sizing-mode writes on frames that already have a parent.
     const containerWidth = node.width;
-    const shouldAutoSize = node.textAutoResize !== "NONE";
     // Simulate word-wrapping at the container boundary (node.width), NOT at
     // contentWidth. contentWidth is the widest rendered line — using it as the
     // wrap threshold would be too narrow and produce extra lines.
     const rawSegments = await measureLineWidths(node, node.width, sharedTemp);
-    // If the text node uses line-count truncation, cap segments to match what
-    // Figma actually displays on screen.
-    const segments = node.textTruncation === "ENDING" && typeof node.maxLines === "number" && node.maxLines > 0
-        ? truncateSegments(rawSegments, node.maxLines)
-        : rawSegments;
+    // Cap segments to match what Figma actually displays on screen. Three
+    // independent mechanisms can clip lines, so we compute each cap and use
+    // whichever is smallest:
+    //
+    //  1. Box-height clipping: whenever the node's own rendered box can be
+    //     smaller than its natural content — fixed-size text (textAutoResize
+    //     "NONE"/"TRUNCATE"), an auto-resizing node with maxHeight set, OR any
+    //     node with textTruncation "ENDING" (whether or not an explicit
+    //     maxLines is set — Figma also auto-truncates to whatever height is
+    //     available, e.g. when a parent auto-layout container constrains the
+    //     text node's resolved height; in every one of these cases node.height
+    //     reflects the resolved, visually-clipped size). The number of whole
+    //     lines that fit is height / effectiveLH (the same relationship
+    //     buildSegmentFrame's paddingBottom trick relies on). A small epsilon
+    //     avoids floating-point rounding from excluding a line that exactly fits.
+    //  2. Ancestor clipping: an auto-height text node that is itself sized to
+    //     its full natural content, but sits inside a smaller clipsContent=true
+    //     parent. node.height/textTruncation don't reflect this — only the
+    //     geometric intersection with clipping ancestors does (see
+    //     getClippedVisibleHeight). Same height → line-count relationship.
+    //  3. Explicit line-count truncation: textTruncation "ENDING" + maxLines.
+    const isFixedHeight = node.textAutoResize === "NONE" || node.textAutoResize === "TRUNCATE";
+    const isEndingTruncated = node.textTruncation === "ENDING";
+    const hasMaxHeight = typeof node.maxHeight === "number";
+    const linesFitInBox = isFixedHeight || isEndingTruncated || hasMaxHeight
+        ? Math.max(1, Math.floor((node.height + effectiveLH * 1e-4) / effectiveLH))
+        : Infinity;
+    const clippedVisibleHeight = getClippedVisibleHeight(node);
+    const linesFitInClippedAncestor = clippedVisibleHeight < node.height - effectiveLH * 1e-4
+        ? Math.max(1, Math.floor((clippedVisibleHeight + effectiveLH * 1e-4) / effectiveLH))
+        : Infinity;
+    const maxLinesCap = isEndingTruncated && typeof node.maxLines === "number" && node.maxLines > 0 ? node.maxLines : Infinity;
+    const visibleLineCap = Math.min(linesFitInBox, linesFitInClippedAncestor, maxLinesCap);
+    const segments = visibleLineCap === Infinity ? rawSegments : truncateSegments(rawSegments, visibleLineCap);
     const totalLines = segments.reduce((sum, s) => sum + s.length, 0);
     // ── Case 1 & 2: Single segment (one or more lines) → one segment frame ────
     // Single-line nodes go through buildSegmentFrame too (not a bare rect) so that
     // paddingBottom = lineSpacing gives the correct total height = effectiveLH,
     // matching the vertical footprint of the original text node.
     if (segments.length === 1) {
-        const frame = buildSegmentFrame(segments[0], containerWidth, contentWidth, blockHeight, lineSpacing, fills, align, shouldAutoSize);
-        applyLayoutProps(node, frame, xOffset);
+        const frame = buildSegmentFrame(segments[0], containerWidth, contentWidth, blockHeight, lineSpacing, fills, align);
+        applyLayoutProps(node, frame, xOffset, yOffset);
         return frame;
     }
     // ── Case 3: Multiple segments → outer frame + inner segment frames ────────
@@ -396,28 +461,29 @@ async function createBlockReplacement(node, sharedTemp) {
     outer.fills = [];
     outer.clipsContent = false;
     for (const segmentLines of segments) {
-        const inner = buildSegmentFrame(segmentLines, containerWidth, contentWidth, blockHeight, lineSpacing, fills, align, shouldAutoSize);
+        const inner = buildSegmentFrame(segmentLines, containerWidth, contentWidth, blockHeight, lineSpacing, fills, align);
         inner.layoutAlign = "INHERIT";
         inner.layoutGrow = 0;
         outer.appendChild(inner);
     }
-    if (shouldAutoSize) {
-        outer.primaryAxisSizingMode = "AUTO";
-    }
-    // If not auto-sizing, keep outer frame at containerWidth (fixed)
-    applyLayoutProps(node, outer, xOffset);
+    // Same reasoning as buildSegmentFrame — always hug height.
+    outer.primaryAxisSizingMode = "AUTO";
+    applyLayoutProps(node, outer, xOffset, yOffset);
     return outer;
 }
 // ── Layout property transfer ───────────────────────────────────────────────
-function applyLayoutProps(from, to, xOffset = 0) {
+function applyLayoutProps(from, to, xOffset = 0, yOffset = 0) {
     to.name = `[block] ${from.name}`;
     // Preserve visibility — hidden text nodes produce hidden blocks
     to.visible = from.visible;
     // Position — meaningful for non-auto-layout parents and absolute-positioned children.
-    // xOffset shifts x to align with the actual rendered text content (e.g. for right-
-    // or center-aligned text whose bounding box is narrower than its container).
+    // xOffset/yOffset shift the position to align with the actual rendered text content
+    // (e.g. for right/center-aligned text narrower than its box, or middle/bottom-aligned
+    // text — textAlignVertical — in a fixed-height box taller than its content) rather
+    // than the box's top-left corner, which the replacement (sized to the visible line
+    // count) would otherwise be anchored to.
     to.x = from.x + xOffset;
-    to.y = from.y;
+    to.y = from.y + yOffset;
     // Constraints (used in non-auto-layout frames)
     to.constraints = from.constraints;
     // Copy layoutAlign (counter-axis alignment within an auto-layout parent).
@@ -450,15 +516,28 @@ async function yieldToUI() {
         lastYieldTime = Date.now();
     }
 }
+// Matches whitespace plus common zero-width/invisible Unicode code points.
+const INVISIBLE_TEXT_RE = /^[\s\u200B\u200C\u200D\u200E\u200F\u2060\uFEFF]*$/;
+// Returns true if the node's text renders nothing visible on screen — e.g.
+// it's empty or contains only spaces, tabs, line breaks, or zero-width
+// characters. Converting such nodes would produce empty blocks.
+function isVisiblyEmpty(node) {
+    return INVISIBLE_TEXT_RE.test(node.characters);
+}
 async function replaceTextNode(textNode, parent, sharedTemp) {
     currentNodeName = textNode.name;
+    // Leave whitespace-only / invisible text nodes untouched — there's nothing
+    // visible to turn into blocks.
+    if (isVisiblyEmpty(textNode))
+        return;
     const children = parent.children;
     const index = children.indexOf(textNode);
     if (index === -1)
         return; // Defensive: node not found in parent
-    // Read layoutSizingHorizontal BEFORE removal — node properties become unreliable after.
+    // Read layout sizing BEFORE removal — node properties become unreliable after.
     const nodeAsAL = textNode;
     const originalSizingH = nodeAsAL.layoutSizingHorizontal;
+    const originalSizingV = nodeAsAL.layoutSizingVertical;
     // Build replacement BEFORE remove() — node properties become unreliable after removal
     const replacement = await createBlockReplacement(textNode, sharedTemp);
     // Remove original, then insert replacement at the same slot.
@@ -466,15 +545,23 @@ async function replaceTextNode(textNode, parent, sharedTemp) {
     // correctly points to the vacated position.
     textNode.remove();
     parent.insertChild(index, replacement);
-    // Apply HUG or FILL sizing after insertion — Figma only allows layoutSizingHorizontal
+    // Apply HUG or FILL sizing after insertion — Figma only allows layoutSizing*
     // writes on frames that already have a parent. Both are safe here because the
     // replacement is now in the same auto-layout parent as the original text node was.
     // FIXED is the default so needs no explicit assignment.
-    if ((originalSizingH === "HUG" || originalSizingH === "FILL") &&
-        "layoutMode" in parent &&
-        parent.layoutMode !== "NONE") {
+    //
+    // Vertical FILL is the key case: if the original text filled its allocated slot
+    // in the parent (e.g. a fixed-height row), the replacement should do the same —
+    // preserving the layout footprint — rather than shrinking to its content height.
+    const isAutoLayoutParent = "layoutMode" in parent && parent.layoutMode !== "NONE";
+    if (isAutoLayoutParent) {
         const repAsAL = replacement;
-        repAsAL.layoutSizingHorizontal = originalSizingH;
+        if (originalSizingH === "HUG" || originalSizingH === "FILL") {
+            repAsAL.layoutSizingHorizontal = originalSizingH;
+        }
+        if (originalSizingV === "FILL") {
+            repAsAL.layoutSizingVertical = "FILL";
+        }
     }
 }
 async function processNode(node, sharedTemp) {
